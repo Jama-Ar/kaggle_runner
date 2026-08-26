@@ -1,0 +1,16 @@
+{
+  "id": "jamaariai/mnist-rl-runner-5",
+  "title": "MNIST RL Runner 5",
+  "code_file": "mnist-rl-runner.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "jamaariai/mnist-rl-source-worker-1"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": []
+}

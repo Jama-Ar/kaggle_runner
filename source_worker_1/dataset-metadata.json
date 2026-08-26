@@ -1,0 +1,10 @@
+{
+  "title": "MNIST RL Source Worker 1",
+  "id": "jamaariai/mnist-rl-source-worker-1",
+  "licenses": [
+    {
+      "name": "other"
+    }
+  ],
+  "description": "Private source snapshot channel. Source repository is MIT licensed."
+}
