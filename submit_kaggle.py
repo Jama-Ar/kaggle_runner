@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -83,15 +84,41 @@ DATASET = f"{USERNAME}/{KAGGLE_CONFIG['source_dataset']}"
 WORKER_PREFIX = KAGGLE_CONFIG["worker_prefix"]
 WORKER_COUNT = int(KAGGLE_CONFIG["worker_count"])
 
+NOTEBOOK_TEMPLATE = (
+    ROOT / KAGGLE_CONFIG["notebook_template"]
+).resolve()
+
+KERNEL_METADATA_TEMPLATE = (
+    ROOT / KAGGLE_CONFIG["kernel_metadata_template"]
+).resolve()
+
+DATASET_METADATA_TEMPLATE = (
+    ROOT / KAGGLE_CONFIG["dataset_metadata_template"]
+).resolve()
+
+PROJECT_WORKDIR = PROJECT_CONFIG.get(
+    "kaggle_workdir",
+    "/kaggle/temp/project",
+)
+
+SETUP_COMMAND = PROJECT_CONFIG.get("setup_command")
+
+if SETUP_COMMAND is not None:
+    if not isinstance(SETUP_COMMAND, str):
+        raise ValueError(
+            "project.setup_command must be a string or null."
+        )
+
+    if not SETUP_COMMAND.strip():
+        SETUP_COMMAND = None
+
 WORKERS = [
     {
         "number": i,
         "kernel": f"{USERNAME}/{WORKER_PREFIX}-{i}",
-        "directory": ROOT / f"worker_{i}",
     }
     for i in range(1, WORKER_COUNT + 1)
 ]
-
 
 def run(command, cwd=None, timeout=None):
     try:
@@ -299,6 +326,28 @@ def get_remote_source_commit():
         return commit if isinstance(commit, str) else None
 
 
+
+def write_dataset_metadata():
+    try:
+        metadata = json.loads(
+            DATASET_METADATA_TEMPLATE.read_text(encoding="utf-8")
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not read dataset metadata template: "
+            f"{DATASET_METADATA_TEMPLATE}"
+        ) from exc
+
+    metadata["id"] = DATASET
+    metadata["title"] = KAGGLE_CONFIG.get(
+        "source_title",
+        KAGGLE_CONFIG["source_dataset"],
+    )
+
+    (SOURCE_PATH / "dataset-metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 def update_source_if_needed(commit, worker_states):
     remote_commit = get_remote_source_commit()
 
@@ -325,6 +374,8 @@ def update_source_if_needed(commit, worker_states):
         )
 
     SOURCE_PATH.mkdir(parents=True, exist_ok=True)
+
+    write_dataset_metadata()
 
     if SOURCE_ZIP_PATH.exists():
         SOURCE_ZIP_PATH.unlink()
@@ -394,6 +445,7 @@ def update_source_if_needed(commit, worker_states):
     print("Source ready.")
 
 
+
 def create_job_directory(
     worker,
     job,
@@ -409,34 +461,79 @@ def create_job_directory(
         )
     )
 
-    template_notebook = (
-        worker["directory"]
-        / "mnist-rl-runner.ipynb"
+    try:
+        kernel_metadata = json.loads(
+            KERNEL_METADATA_TEMPLATE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not read kernel metadata template: "
+            f"{KERNEL_METADATA_TEMPLATE}"
+        ) from exc
+
+    code_file = kernel_metadata.get(
+        "code_file",
+        "runner.ipynb",
     )
 
-    template_metadata = (
-        worker["directory"]
-        / "kernel-metadata.json"
+    if (
+        not isinstance(code_file, str)
+        or not code_file
+        or Path(code_file).name != code_file
+    ):
+        raise ValueError(
+            "kernel metadata template requires a simple "
+            "'code_file' filename."
+        )
+
+    notebook_target = temp_dir / code_file
+    metadata_target = temp_dir / "kernel-metadata.json"
+
+    shutil.copy2(
+        NOTEBOOK_TEMPLATE,
+        notebook_target,
     )
 
-    notebook_target = (
-        temp_dir
-        / "mnist-rl-runner.ipynb"
+    kernel_metadata["id"] = worker["kernel"]
+    kernel_metadata["title"] = (
+        f"{WORKER_PREFIX}-{worker['number']}"
     )
 
-    metadata_target = (
-        temp_dir
-        / "kernel-metadata.json"
+    dataset_sources = kernel_metadata.get(
+        "dataset_sources",
+        [],
     )
 
-    shutil.copy2(template_notebook, notebook_target)
-    shutil.copy2(template_metadata, metadata_target)
+    if not isinstance(dataset_sources, list):
+        raise ValueError(
+            "kernel metadata template 'dataset_sources' "
+            "must be a list."
+        )
+
+    kernel_metadata["dataset_sources"] = list(
+        dict.fromkeys(
+            [DATASET, *dataset_sources]
+        )
+    )
+
+    metadata_target.write_text(
+        json.dumps(
+            kernel_metadata,
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     notebook = nbformat.read(
         notebook_target,
         as_version=4,
     )
 
+    configuration_cell = None
     definition_cell = None
     execution_cell = None
 
@@ -444,11 +541,19 @@ def create_job_directory(
         if cell.cell_type != "code":
             continue
 
+        if "# Runner Configuration" in cell.source:
+            configuration_cell = cell
+
         if "# Job Definition" in cell.source:
             definition_cell = cell
 
         if "# Job Execution" in cell.source:
             execution_cell = cell
+
+    if configuration_cell is None:
+        raise RuntimeError(
+            "Could not find '# Runner Configuration' cell."
+        )
 
     if definition_cell is None:
         raise RuntimeError(
@@ -460,42 +565,21 @@ def create_job_directory(
             "Could not find '# Job Execution' cell."
         )
 
+    configuration_cell.source = (
+        "# Runner Configuration\n\n"
+        f"PROJECT_WORKDIR = {PROJECT_WORKDIR!r}\n"
+        f"SETUP_COMMAND = {SETUP_COMMAND!r}\n"
+        f"SOURCE_COMMIT = {commit!r}"
+    )
+
     definition_cell.source = (
         "# Job Definition\n\n"
         f"JOB_ID = {job['id']!r}\n"
         f"EXECUTION_ID = {execution_id!r}\n"
         f"SUBMITTED_AT = {submitted_at!r}\n"
         f"WORKER_NUMBER = {worker['number']!r}\n"
-        f"SOURCE_COMMIT = {commit!r}\n"
         f"COMMAND = {job['command']!r}"
     )
-
-    execution_cell.source = """# Job Execution
-
-import json
-import subprocess
-from pathlib import Path
-
-job_metadata = {
-    "job_id": JOB_ID,
-    "execution_id": EXECUTION_ID,
-    "submitted_at": SUBMITTED_AT,
-    "worker": WORKER_NUMBER,
-    "source_commit": SOURCE_COMMIT,
-    "command": COMMAND,
-}
-
-Path("/kaggle/working/job_metadata.json").write_text(
-    json.dumps(job_metadata, indent=2),
-    encoding="utf-8",
-)
-
-subprocess.run(
-    ["bash", "-c", COMMAND],
-    check=True,
-    cwd="/kaggle/temp/mnist_active_screening",
-)
-"""
 
     nbformat.write(
         notebook,
@@ -503,6 +587,7 @@ subprocess.run(
     )
 
     return temp_dir
+
 
 
 def save_history(record):
@@ -1203,10 +1288,418 @@ def submit_batch(
     print(f"Source commit: {commit}")
 
 
+
+def _run_kaggle_process(command, timeout=120):
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    try:
+        return subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Timed out running: {' '.join(map(str, command))}"
+        ) from exc
+
+
+def _kaggle_error_text(result):
+    return (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or f"Kaggle CLI exit code {result.returncode}."
+    )
+
+
+def _probe_kaggle_resource(command, resource_name):
+    result = _run_kaggle_process(command)
+
+    if result.returncode == 0:
+        return True
+
+    details = _kaggle_error_text(result)
+    normalized = details.lower()
+
+    not_found_markers = (
+        "404",
+        "not found",
+        "does not exist",
+    )
+
+    if any(marker in normalized for marker in not_found_markers):
+        return False
+
+    raise RuntimeError(
+        f"Could not check {resource_name}: {details}"
+    )
+
+
+def source_dataset_exists():
+    return _probe_kaggle_resource(
+        [
+            "kaggle",
+            "datasets",
+            "status",
+            DATASET,
+        ],
+        f"source dataset '{DATASET}'",
+    )
+
+
+def worker_exists(worker):
+    return _probe_kaggle_resource(
+        [
+            "kaggle",
+            "kernels",
+            "status",
+            worker["kernel"],
+        ],
+        f"worker '{worker['kernel']}'",
+    )
+
+
+def write_initial_source_snapshot(commit):
+    SOURCE_PATH.mkdir(parents=True, exist_ok=True)
+    write_dataset_metadata()
+
+    if SOURCE_ZIP_PATH.exists():
+        SOURCE_ZIP_PATH.unlink()
+
+    run(
+        [
+            "git",
+            "archive",
+            "--format=zip",
+            f"--output={SOURCE_ZIP_PATH}",
+            f"{REMOTE}/{BRANCH}",
+        ],
+        cwd=REPO_PATH,
+    )
+
+    SOURCE_MANIFEST_PATH.write_text(
+        json.dumps(
+            {
+                "commit": commit,
+                "remote": REMOTE,
+                "branch": BRANCH,
+                "created_at": utc_now(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def wait_for_source_dataset(timeout=300):
+    deadline = time.time() + timeout
+
+    while True:
+        result = _run_kaggle_process(
+            [
+                "kaggle",
+                "datasets",
+                "status",
+                DATASET,
+            ]
+        )
+
+        if result.returncode == 0:
+            status = result.stdout.strip().lower()
+
+            if status == "ready":
+                return
+
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"Timed out waiting for source dataset '{DATASET}'."
+            )
+
+        time.sleep(3)
+
+
+def create_source_dataset(commit):
+    write_initial_source_snapshot(commit)
+
+    print(f"Creating private source dataset: {DATASET}")
+
+    result = _run_kaggle_process(
+        [
+            "kaggle",
+            "datasets",
+            "create",
+            "-p",
+            str(SOURCE_PATH),
+            "-q",
+        ],
+        timeout=300,
+    )
+
+    if result.returncode != 0:
+        # Kaggle CLI can fail after a successful remote action on some
+        # Windows console encodings. Verify remote state before failing.
+        if not source_dataset_exists():
+            raise RuntimeError(
+                f"Could not create source dataset '{DATASET}': "
+                f"{_kaggle_error_text(result)}"
+            )
+
+    wait_for_source_dataset()
+    print(f"Source dataset ready: {DATASET}")
+
+
+def create_worker_initialization_directory(worker):
+    temp_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"kaggle_init_worker_{worker['number']}_"
+        )
+    )
+
+    try:
+        kernel_metadata = json.loads(
+            KERNEL_METADATA_TEMPLATE.read_text(
+                encoding="utf-8"
+            )
+        )
+    except (json.JSONDecodeError, OSError) as exc:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"Could not read kernel metadata template: "
+            f"{KERNEL_METADATA_TEMPLATE}"
+        ) from exc
+
+    code_file = kernel_metadata.get(
+        "code_file",
+        "runner.ipynb",
+    )
+
+    if (
+        not isinstance(code_file, str)
+        or not code_file
+        or Path(code_file).name != code_file
+    ):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise ValueError(
+            "kernel metadata template requires a simple "
+            "'code_file' filename."
+        )
+
+    kernel_metadata["id"] = worker["kernel"]
+    kernel_metadata["title"] = (
+        f"{WORKER_PREFIX}-{worker['number']}"
+    )
+
+    dataset_sources = kernel_metadata.get(
+        "dataset_sources",
+        [],
+    )
+
+    if not isinstance(dataset_sources, list):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise ValueError(
+            "kernel metadata template 'dataset_sources' "
+            "must be a list."
+        )
+
+    kernel_metadata["dataset_sources"] = list(
+        dict.fromkeys(
+            [DATASET, *dataset_sources]
+        )
+    )
+
+    (temp_dir / "kernel-metadata.json").write_text(
+        json.dumps(
+            kernel_metadata,
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    notebook = nbformat.v4.new_notebook()
+    notebook.cells = [
+        nbformat.v4.new_code_cell(
+            "# Worker Initialization\n\n"
+            "print('Kaggle runner worker initialized.')"
+        )
+    ]
+
+    nbformat.write(
+        notebook,
+        temp_dir / code_file,
+    )
+
+    return temp_dir
+
+
+def create_worker(worker):
+    temp_dir = create_worker_initialization_directory(worker)
+
+    try:
+        print(
+            f"Creating worker-{worker['number']}: "
+            f"{worker['kernel']}"
+        )
+
+        result = _run_kaggle_process(
+            [
+                "kaggle",
+                "kernels",
+                "push",
+                "-p",
+                str(temp_dir),
+            ],
+            timeout=300,
+        )
+
+        if result.returncode != 0:
+            if not worker_exists(worker):
+                raise RuntimeError(
+                    f"Could not create worker-{worker['number']}: "
+                    f"{_kaggle_error_text(result)}"
+                )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def wait_for_worker_initialization(workers, timeout=600):
+    if not workers:
+        return
+
+    pending = {
+        worker["number"]: worker
+        for worker in workers
+    }
+    deadline = time.time() + timeout
+
+    while pending:
+        for number, worker in list(pending.items()):
+            status = get_worker_status(worker)
+
+            if status == "COMPLETE":
+                print(f"worker-{number}: ready")
+                del pending[number]
+                continue
+
+            if status in {"ERROR", "CANCELLED"}:
+                raise RuntimeError(
+                    f"worker-{number} initialization ended with "
+                    f"status {status}. Check its Kaggle logs."
+                )
+
+        if not pending:
+            return
+
+        if time.time() >= deadline:
+            pending_text = ", ".join(
+                f"worker-{number}"
+                for number in pending
+            )
+            raise RuntimeError(
+                "Timed out waiting for worker initialization: "
+                f"{pending_text}"
+            )
+
+        time.sleep(3)
+
+
+def validate_initialization_files():
+    required_paths = [
+        REPO_PATH,
+        NOTEBOOK_TEMPLATE,
+        KERNEL_METADATA_TEMPLATE,
+        DATASET_METADATA_TEMPLATE,
+    ]
+
+    missing = [
+        path
+        for path in required_paths
+        if not path.exists()
+    ]
+
+    if missing:
+        missing_text = ", ".join(
+            str(path)
+            for path in missing
+        )
+        raise RuntimeError(
+            f"Initialization requires existing paths: {missing_text}"
+        )
+
+
+def initialize_workspace(verbose=False):
+    validate_initialization_files()
+
+    print("Checking Kaggle workspace...")
+
+    dataset_present = source_dataset_exists()
+    worker_presence = {
+        worker["number"]: worker_exists(worker)
+        for worker in WORKERS
+    }
+
+    if dataset_present:
+        print(f"Source dataset: existing ({DATASET})")
+    else:
+        print(f"Source dataset: missing ({DATASET})")
+
+    for worker in WORKERS:
+        state = "existing" if worker_presence[worker["number"]] else "missing"
+        print(
+            f"worker-{worker['number']}: {state} "
+            f"({worker['kernel']})"
+        )
+
+    all_workers_present = all(worker_presence.values())
+
+    if dataset_present and all_workers_present:
+        print()
+        print("Workspace already initialized. No changes made.")
+        print(f"Source dataset: {DATASET}")
+        print(f"Workers: {WORKER_COUNT}/{WORKER_COUNT} existing")
+        return
+
+    if not dataset_present:
+        commit = get_latest_project_commit()
+        create_source_dataset(commit)
+
+    created_workers = []
+
+    for worker in WORKERS:
+        if worker_presence[worker["number"]]:
+            continue
+
+        create_worker(worker)
+        created_workers.append(worker)
+
+    wait_for_worker_initialization(created_workers)
+
+    print()
+    print("Workspace initialization complete.")
+    print(f"Source dataset: {DATASET}")
+    print(f"Workers: {WORKER_COUNT}/{WORKER_COUNT} existing")
+
+    if verbose and created_workers:
+        created_text = ", ".join(
+            f"worker-{worker['number']}"
+            for worker in created_workers
+        )
+        print(f"Created workers: {created_text}")
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Submit, monitor, and collect Kaggle jobs."
+            "Initialize, submit, monitor, and collect Kaggle jobs."
         )
     )
 
@@ -1236,6 +1729,15 @@ def main():
     )
 
     parser.add_argument(
+        "--init",
+        action="store_true",
+        help=(
+            "Initialize missing Kaggle source and worker "
+            "resources without modifying existing ones."
+        ),
+    )
+
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Show current status of all Kaggle workers.",
@@ -1251,6 +1753,33 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.init:
+        if args.job_file:
+            parser.error(
+                "Do not provide a job file with --init."
+            )
+
+        if args.job_ids:
+            parser.error(
+                "--id cannot be combined with --init."
+            )
+
+        if args.status:
+            parser.error(
+                "--status cannot be combined with --init."
+            )
+
+        if args.results:
+            parser.error(
+                "--results cannot be combined with --init."
+            )
+
+        initialize_workspace(
+            verbose=args.verbose,
+        )
+
+        return
 
     if args.status:
         if args.job_file:
@@ -1302,6 +1831,7 @@ def main():
         args.job_ids,
         args.verbose,
     )
+
 
 
 if __name__ == "__main__":

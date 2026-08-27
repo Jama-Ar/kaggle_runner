@@ -1,9 +1,12 @@
 __pycache__/
 *.pyc
 
-source_worker_1/source.zip
-source_worker_1/source_manifest.json
+runner.yaml
+jobs.yaml
+
+.kaggle/
+source_worker_*/
+worker_*/
 
 submission_history.jsonl
 results/
-jobs.yaml

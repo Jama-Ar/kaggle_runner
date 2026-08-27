@@ -1,0 +1,15 @@
+project:
+  repo_path: ../your_project
+  remote: origin
+  branch: main
+  kaggle_workdir: /kaggle/temp/project
+  setup_command: null
+kaggle:
+  username: your_kaggle_username
+  source_dataset: your-source-dataset
+  source_dir: .kaggle/source
+  worker_prefix: kaggle-runner
+  worker_count: 5
+  notebook_template: templates/runner.ipynb
+  kernel_metadata_template: templates/kernel-metadata.json
+  dataset_metadata_template: templates/dataset-metadata.json
