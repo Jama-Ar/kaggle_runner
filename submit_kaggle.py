@@ -704,8 +704,88 @@ def get_current_job_metadata(worker):
 
 
 
+
+def get_kaggle_version_for_metadata(worker, metadata):
+    execution_id = metadata.get("execution_id")
+
+    if not isinstance(execution_id, str) or not execution_id:
+        return None
+
+    history = load_latest_history_by_worker()
+    record = history.get(worker["number"])
+
+    if not isinstance(record, dict):
+        return None
+
+    if record.get("execution_id") != execution_id:
+        return None
+
+    version = record.get("version")
+
+    if isinstance(version, bool):
+        return None
+
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        return None
+
+    return version if version > 0 else None
+
+
+def find_local_archive_for_execution(metadata):
+    execution_id = metadata.get("execution_id")
+
+    if (
+        not isinstance(execution_id, str)
+        or not execution_id
+        or not RESULTS_PATH.exists()
+    ):
+        return None
+
+    for archive_path in RESULTS_PATH.glob("*.zip"):
+        try:
+            with zipfile.ZipFile(
+                archive_path,
+                "r",
+            ) as archive:
+                metadata_names = [
+                    name
+                    for name in archive.namelist()
+                    if name.endswith("job_metadata.json")
+                ]
+
+                if not metadata_names:
+                    continue
+
+                target_name = min(
+                    metadata_names,
+                    key=lambda name: len(
+                        Path(name).parts
+                    ),
+                )
+
+                archived_metadata = json.loads(
+                    archive.read(target_name)
+                )
+
+                if (
+                    archived_metadata.get("execution_id")
+                    == execution_id
+                ):
+                    return archive_path
+        except (
+            zipfile.BadZipFile,
+            json.JSONDecodeError,
+            OSError,
+        ):
+            continue
+
+    return None
+
 def archive_path_for_metadata(worker, metadata):
     job_id = safe_name(str(metadata.get("job_id", "job")))
+
     execution_id = metadata.get("execution_id")
 
     if not isinstance(execution_id, str) or not execution_id:
@@ -716,10 +796,27 @@ def archive_path_for_metadata(worker, metadata):
             + uuid.uuid4().hex[:8]
         )
 
+    version = get_kaggle_version_for_metadata(
+        worker,
+        metadata,
+    )
+
+    version_label = (
+        f"v{version}"
+        if version is not None
+        else "vunknown"
+    )
+
     return (
         RESULTS_PATH
-        / f"{job_id}__worker-{worker['number']}__{safe_name(execution_id)}.zip"
+        / (
+            f"{job_id}"
+            f"__worker-{worker['number']}"
+            f"__{version_label}"
+            f"__{safe_name(execution_id)}.zip"
+        )
     )
+
 
 
 
@@ -745,6 +842,18 @@ def archive_worker_output(
         return None, metadata
 
     RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+
+    existing_archive = find_local_archive_for_execution(
+        metadata
+    )
+
+    if existing_archive is not None:
+        if verbose:
+            print(
+                f"Result already archived: {existing_archive}"
+            )
+
+        return existing_archive, metadata
 
     archive_path = archive_path_for_metadata(
         worker,
@@ -815,6 +924,10 @@ def archive_worker_output(
             "archived_at": utc_now(),
             "worker": worker["number"],
             "kernel": worker["kernel"],
+            "kaggle_version": get_kaggle_version_for_metadata(
+                worker,
+                metadata_after,
+            ),
             "kaggle_status": status,
             "job_metadata": metadata_after,
         }

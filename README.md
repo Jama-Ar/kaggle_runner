@@ -98,6 +98,22 @@ python submit_kaggle.py --results JOB_ID
 
 Kaggle stores notebook outputs remotely. Downloaded outputs are archived locally under `results/`.
 
+New archives use the naming scheme:
+
+```text
+<job-id>__worker-<n>__v<kaggle-version>__<execution-id>.zip
+```
+
+Example:
+
+```text
+test_01__worker-1__v11__20260827T103751Z_bdcf68ee.zip
+```
+
+The execution ID contains a UTC timestamp plus a random suffix and remains the authoritative uniqueness component. The Kaggle version is included for readability. If the version is unavailable on the current machine, `vunknown` is used while the execution ID still keeps the archive unique.
+
+Existing archives keep their original filenames and are recognized by their embedded execution ID, so applying a new naming scheme does not duplicate already archived runs.
+
 ## Local project files
 
 The following are intentionally not tracked:
