@@ -79,6 +79,9 @@ SOURCE_PATH = (ROOT / KAGGLE_CONFIG["source_dir"]).resolve()
 SOURCE_ZIP_PATH = SOURCE_PATH / "source.zip"
 SOURCE_MANIFEST_PATH = SOURCE_PATH / "source_manifest.json"
 
+SOURCE_FORMAT_VERSION = 2
+SOURCE_MARKER_NAME = "kaggle_runner_source.json"
+
 DATASET = f"{USERNAME}/{KAGGLE_CONFIG['source_dataset']}"
 
 WORKER_PREFIX = KAGGLE_CONFIG["worker_prefix"]
@@ -282,7 +285,8 @@ def get_latest_project_commit():
     )
 
 
-def get_remote_source_commit():
+
+def get_remote_source_manifest():
     with tempfile.TemporaryDirectory(
         prefix="kaggle_source_manifest_"
     ) as temp_name:
@@ -309,21 +313,24 @@ def get_remote_source_commit():
         if result.returncode != 0:
             return None
 
-        manifests = list(temp_dir.rglob("source_manifest.json"))
+        manifests = list(
+            temp_dir.rglob("source_manifest.json")
+        )
 
         if not manifests:
             return None
 
         try:
             data = json.loads(
-                manifests[0].read_text(encoding="utf-8")
+                manifests[0].read_text(
+                    encoding="utf-8"
+                )
             )
         except (json.JSONDecodeError, OSError):
             return None
 
-        commit = data.get("commit")
+        return data if isinstance(data, dict) else None
 
-        return commit if isinstance(commit, str) else None
 
 
 
@@ -348,10 +355,77 @@ def write_dataset_metadata():
         json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-def update_source_if_needed(commit, worker_states):
-    remote_commit = get_remote_source_commit()
 
-    if remote_commit == commit:
+def add_source_marker_to_archive(commit):
+    marker = {
+        "format_version": SOURCE_FORMAT_VERSION,
+        "commit": commit,
+        "remote": REMOTE,
+        "branch": BRANCH,
+    }
+
+    with zipfile.ZipFile(
+        SOURCE_ZIP_PATH,
+        mode="a",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        archive.writestr(
+            SOURCE_MARKER_NAME,
+            json.dumps(
+                marker,
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+        )
+
+    with zipfile.ZipFile(
+        SOURCE_ZIP_PATH,
+        mode="r",
+    ) as archive:
+        if SOURCE_MARKER_NAME not in archive.namelist():
+            raise RuntimeError(
+                "Source marker was not written to source archive."
+            )
+
+        try:
+            stored_marker = json.loads(
+                archive.read(
+                    SOURCE_MARKER_NAME
+                ).decode("utf-8")
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise RuntimeError(
+                "Source marker in archive is invalid."
+            ) from exc
+
+    if stored_marker.get("commit") != commit:
+        raise RuntimeError(
+            "Source marker commit does not match archive commit."
+        )
+
+def update_source_if_needed(commit, worker_states):
+    remote_manifest = get_remote_source_manifest()
+
+    remote_commit = (
+        remote_manifest.get("commit")
+        if isinstance(remote_manifest, dict)
+        else None
+    )
+
+    remote_format_version = (
+        remote_manifest.get("format_version")
+        if isinstance(remote_manifest, dict)
+        else None
+    )
+
+    if (
+        remote_commit == commit
+        and remote_format_version == SOURCE_FORMAT_VERSION
+    ):
         print("Kaggle source is already up to date.")
         return
 
@@ -373,7 +447,10 @@ def update_source_if_needed(commit, worker_states):
             "switching the shared source version."
         )
 
-    SOURCE_PATH.mkdir(parents=True, exist_ok=True)
+    SOURCE_PATH.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     write_dataset_metadata()
 
@@ -391,12 +468,16 @@ def update_source_if_needed(commit, worker_states):
         cwd=REPO_PATH,
     )
 
+    add_source_marker_to_archive(commit)
+
     SOURCE_MANIFEST_PATH.write_text(
         json.dumps(
             {
+                "format_version": SOURCE_FORMAT_VERSION,
                 "commit": commit,
                 "remote": REMOTE,
                 "branch": BRANCH,
+                "marker": SOURCE_MARKER_NAME,
                 "created_at": utc_now(),
             },
             indent=2,
@@ -405,6 +486,10 @@ def update_source_if_needed(commit, worker_states):
     )
 
     print(f"Source commit: {commit}")
+    print(
+        f"Source format: v{SOURCE_FORMAT_VERSION} "
+        f"({SOURCE_MARKER_NAME})"
+    )
     print("Uploading source to Kaggle...")
 
     run(
@@ -445,6 +530,99 @@ def update_source_if_needed(commit, worker_states):
     print("Source ready.")
 
 
+
+
+
+
+def ensure_notebook_kernel_metadata(
+    notebook,
+    kernel_metadata,
+):
+    kernelspec = notebook.metadata.get("kernelspec")
+
+    if not isinstance(kernelspec, dict):
+        kernelspec = {}
+
+    kernelspec["display_name"] = "Python 3"
+    kernelspec["language"] = "python"
+    kernelspec["name"] = "python3"
+
+    notebook.metadata["kernelspec"] = kernelspec
+
+    language_info = notebook.metadata.get(
+        "language_info"
+    )
+
+    if not isinstance(language_info, dict):
+        language_info = {}
+
+    language_info.update(
+        {
+            "name": "python",
+            "mimetype": "text/x-python",
+            "file_extension": ".py",
+            "pygments_lexer": "ipython3",
+            "nbconvert_exporter": "python",
+            "codemirror_mode": {
+                "name": "ipython",
+                "version": 3,
+            },
+        }
+    )
+
+    notebook.metadata["language_info"] = language_info
+
+    kaggle_metadata = notebook.metadata.get("kaggle")
+
+    if not isinstance(kaggle_metadata, dict):
+        kaggle_metadata = {}
+
+    enable_gpu = bool(
+        kernel_metadata.get("enable_gpu", False)
+    )
+
+    enable_internet = bool(
+        kernel_metadata.get("enable_internet", False)
+    )
+
+    kaggle_metadata.update(
+        {
+            "accelerator": (
+                "gpu"
+                if enable_gpu
+                else "none"
+            ),
+            "dataSources": [],
+            "isGpuEnabled": enable_gpu,
+            "isInternetEnabled": enable_internet,
+            "language": "python",
+            "sourceType": "notebook",
+        }
+    )
+
+    notebook.metadata["kaggle"] = kaggle_metadata
+
+    nbformat.validate(notebook)
+
+    if (
+        notebook.metadata["kernelspec"].get("name")
+        != "python3"
+    ):
+        raise RuntimeError(
+            "Generated notebook has no valid Python "
+            "kernelspec."
+        )
+
+    if (
+        notebook.metadata["kaggle"].get("language")
+        != "python"
+        or notebook.metadata["kaggle"].get("sourceType")
+        != "notebook"
+    ):
+        raise RuntimeError(
+            "Generated notebook has invalid Kaggle "
+            "notebook metadata."
+        )
 
 def create_job_directory(
     worker,
@@ -531,6 +709,11 @@ def create_job_directory(
     notebook = nbformat.read(
         notebook_target,
         as_version=4,
+    )
+
+    ensure_notebook_kernel_metadata(
+        notebook,
+        kernel_metadata,
     )
 
     configuration_cell = None

@@ -47,7 +47,9 @@ project:
     python -m pip install -e .
 ```
 
-The setup command runs inside `project.kaggle_workdir` before each job command.
+Each source snapshot contains a runner-owned `kaggle_runner_source.json` marker at the project root. The Kaggle notebook resolves the project root from this marker, so source discovery does not depend on project-specific files or on whether Kaggle exposes an uploaded ZIP as an archive or as expanded files.
+
+The setup command runs inside `project.kaggle_workdir` before each job command. Setup uses fail-fast shell semantics, so any failing setup command aborts the notebook instead of being masked by a later successful command.
 
 ## Templates
 
@@ -63,7 +65,7 @@ The notebook template requires these marker cells:
 - `# Job Definition`
 - `# Job Execution`
 
-Additional notebook cells may be added around them.
+Additional notebook cells may be added around them. Before submission, the runner validates and restores both the standard Python 3 `kernelspec` and Kaggle's notebook metadata (`metadata.kaggle.language=python`, `metadata.kaggle.sourceType=notebook`).
 
 ## Jobs
 
