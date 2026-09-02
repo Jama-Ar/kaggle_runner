@@ -86,6 +86,7 @@ DATASET = f"{USERNAME}/{KAGGLE_CONFIG['source_dataset']}"
 
 WORKER_PREFIX = KAGGLE_CONFIG["worker_prefix"]
 WORKER_COUNT = int(KAGGLE_CONFIG["worker_count"])
+NOTEBOOK_CPU_COUNT = 4
 
 NOTEBOOK_TEMPLATE = (
     ROOT / KAGGLE_CONFIG["notebook_template"]
@@ -178,13 +179,13 @@ def load_jobs(path):
         )
 
     seen_ids = set()
+    normalized_jobs = []
 
     for index, job in enumerate(jobs, start=1):
         if not isinstance(job, dict):
             raise ValueError(f"Job {index} is invalid.")
 
         job_id = job.get("id")
-        command = job.get("command")
 
         if not isinstance(job_id, str) or not job_id:
             raise ValueError(
@@ -194,14 +195,98 @@ def load_jobs(path):
         if job_id in seen_ids:
             raise ValueError(f"Duplicate job id: {job_id}")
 
-        if not isinstance(command, str) or not command.strip():
+        has_command = "command" in job
+        has_parallel = "parallel" in job
+
+        if has_command == has_parallel:
             raise ValueError(
-                f"Job '{job_id}' requires a non-empty 'command'."
+                f"Job '{job_id}' requires exactly one of "
+                "'command' or 'parallel'."
             )
 
-        seen_ids.add(job_id)
+        if has_command:
+            command = job.get("command")
 
-    return jobs
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError(
+                    f"Job '{job_id}' requires a non-empty 'command'."
+                )
+
+            normalized_job = {
+                "id": job_id,
+                "mode": "single",
+                "tasks": [
+                    {
+                        "cpus": NOTEBOOK_CPU_COUNT,
+                        "command": command,
+                    }
+                ],
+            }
+
+        else:
+            parallel = job.get("parallel")
+
+            if not isinstance(parallel, list) or len(parallel) < 2:
+                raise ValueError(
+                    f"Job '{job_id}' parallel mode requires at least "
+                    "two tasks."
+                )
+
+            tasks = []
+            total_cpus = 0
+
+            for task_index, task in enumerate(
+                parallel,
+                start=1,
+            ):
+                if not isinstance(task, dict):
+                    raise ValueError(
+                        f"Job '{job_id}' task {task_index} is invalid."
+                    )
+
+                cpus = task.get("cpus")
+                command = task.get("command")
+
+                if (
+                    isinstance(cpus, bool)
+                    or not isinstance(cpus, int)
+                    or cpus < 1
+                ):
+                    raise ValueError(
+                        f"Job '{job_id}' task {task_index} requires "
+                        "a positive integer 'cpus'."
+                    )
+
+                if not isinstance(command, str) or not command.strip():
+                    raise ValueError(
+                        f"Job '{job_id}' task {task_index} requires "
+                        "a non-empty 'command'."
+                    )
+
+                total_cpus += cpus
+                tasks.append(
+                    {
+                        "cpus": cpus,
+                        "command": command,
+                    }
+                )
+
+            if total_cpus != NOTEBOOK_CPU_COUNT:
+                raise ValueError(
+                    f"Job '{job_id}' parallel CPU allocation must sum "
+                    f"to {NOTEBOOK_CPU_COUNT}, got {total_cpus}."
+                )
+
+            normalized_job = {
+                "id": job_id,
+                "mode": "parallel",
+                "tasks": tasks,
+            }
+
+        seen_ids.add(job_id)
+        normalized_jobs.append(normalized_job)
+
+    return normalized_jobs
 
 
 def select_jobs(jobs, requested_ids):
@@ -624,6 +709,234 @@ def ensure_notebook_kernel_metadata(
             "notebook metadata."
         )
 
+
+def build_job_execution_cell_source():
+    return """# Job Execution
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+THREAD_LIMIT_VARIABLES = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "NUMEXPR_MAX_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "RAYON_NUM_THREADS",
+)
+
+if JOB_MODE not in {"single", "parallel"}:
+    raise RuntimeError(
+        f"Unsupported job mode: {JOB_MODE!r}"
+    )
+
+if not isinstance(JOB_TASKS, list) or not JOB_TASKS:
+    raise RuntimeError("Job has no executable tasks.")
+
+requested_cpus = sum(
+    task["cpus"]
+    for task in JOB_TASKS
+)
+
+if requested_cpus != CPU_BUDGET:
+    raise RuntimeError(
+        f"Job requests {requested_cpus} CPUs, "
+        f"expected exactly {CPU_BUDGET}."
+    )
+
+if not hasattr(os, "sched_getaffinity"):
+    raise RuntimeError(
+        "CPU affinity requires a Linux runtime."
+    )
+
+allowed_cpus = sorted(
+    os.sched_getaffinity(0)
+)
+
+if len(allowed_cpus) < CPU_BUDGET:
+    raise RuntimeError(
+        f"Runtime exposes only {len(allowed_cpus)} CPUs, "
+        f"but this job requires {CPU_BUDGET}."
+    )
+
+cpu_pool = allowed_cpus[:CPU_BUDGET]
+resolved_tasks = []
+cpu_offset = 0
+
+for task_index, task in enumerate(
+    JOB_TASKS,
+    start=1,
+):
+    cpus = task["cpus"]
+    cpu_ids = cpu_pool[
+        cpu_offset:cpu_offset + cpus
+    ]
+    cpu_offset += cpus
+
+    resolved_tasks.append(
+        {
+            "index": task_index,
+            "cpus": cpus,
+            "cpu_ids": cpu_ids,
+            "command": task["command"],
+            "returncode": None,
+        }
+    )
+
+job_metadata = {
+    "job_id": JOB_ID,
+    "execution_id": EXECUTION_ID,
+    "submitted_at": SUBMITTED_AT,
+    "worker": WORKER_NUMBER,
+    "source_commit": SOURCE_COMMIT,
+    "mode": JOB_MODE,
+    "cpu_budget": CPU_BUDGET,
+    "tasks": resolved_tasks,
+}
+
+if JOB_MODE == "single":
+    job_metadata["command"] = JOB_TASKS[0]["command"]
+
+metadata_path = Path(
+    "/kaggle/working/job_metadata.json"
+)
+
+
+def write_job_metadata():
+    metadata_path.write_text(
+        json.dumps(
+            job_metadata,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+write_job_metadata()
+
+start_signal = (
+    Path("/kaggle/working")
+    / f".kaggle_runner_start_{EXECUTION_ID}"
+)
+
+if start_signal.exists():
+    start_signal.unlink()
+
+processes = []
+
+try:
+    for task in resolved_tasks:
+        env = os.environ.copy()
+
+        for variable in THREAD_LIMIT_VARIABLES:
+            env[variable] = str(task["cpus"])
+
+        env["KAGGLE_RUNNER_TASK_INDEX"] = str(
+            task["index"]
+        )
+        env["KAGGLE_RUNNER_TASK_CPUS"] = str(
+            task["cpus"]
+        )
+        env["KAGGLE_RUNNER_CPU_IDS"] = ",".join(
+            str(cpu_id)
+            for cpu_id in task["cpu_ids"]
+        )
+
+        affinity_code = (
+            "import os\\n"
+            "import sys\\n"
+            "import time\\n"
+            f"start_signal = {str(start_signal)!r}\\n"
+            "while not os.path.exists(start_signal):\\n"
+            "    time.sleep(0.01)\\n"
+            f"os.sched_setaffinity(0, {task['cpu_ids']!r})\\n"
+            'os.execvp("bash", ["bash", "-c", sys.argv[1]])\\n'
+        )
+
+        print(
+            f"Prepared task-{task['index']} | "
+            f"cpus={task['cpu_ids']}"
+        )
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                affinity_code,
+                task["command"],
+            ],
+            cwd=PROJECT_WORKDIR,
+            env=env,
+        )
+
+        processes.append(
+            (task, process)
+        )
+
+    start_signal.touch()
+
+    print(
+        f"Released {len(processes)} task(s) "
+        "for concurrent execution."
+    )
+
+except Exception:
+    for _, process in processes:
+        if process.poll() is None:
+            process.terminate()
+
+    for _, process in processes:
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    raise
+
+failures = []
+
+try:
+    for task, process in processes:
+        returncode = process.wait()
+        task["returncode"] = returncode
+
+        print(
+            f"task-{task['index']} finished | "
+            f"returncode={returncode}"
+        )
+
+        if returncode != 0:
+            failures.append(
+                (
+                    task["index"],
+                    returncode,
+                )
+            )
+
+finally:
+    if start_signal.exists():
+        start_signal.unlink()
+
+    write_job_metadata()
+
+if failures:
+    details = ", ".join(
+        f"task-{task_index}={returncode}"
+        for task_index, returncode in failures
+    )
+
+    raise RuntimeError(
+        f"Job task failure(s): {details}"
+    )
+"""
+
+
 def create_job_directory(
     worker,
     job,
@@ -761,7 +1074,13 @@ def create_job_directory(
         f"EXECUTION_ID = {execution_id!r}\n"
         f"SUBMITTED_AT = {submitted_at!r}\n"
         f"WORKER_NUMBER = {worker['number']!r}\n"
-        f"COMMAND = {job['command']!r}"
+        f"CPU_BUDGET = {NOTEBOOK_CPU_COUNT!r}\n"
+        f"JOB_MODE = {job['mode']!r}\n"
+        f"JOB_TASKS = {job['tasks']!r}"
+    )
+
+    execution_cell.source = (
+        build_job_execution_cell_source()
     )
 
     nbformat.write(
@@ -1267,8 +1586,12 @@ def submit_job(
         "kernel": worker["kernel"],
         "version": version,
         "source_commit": commit,
-        "command": job["command"],
+        "mode": job["mode"],
+        "tasks": job["tasks"],
     }
+
+    if job["mode"] == "single":
+        record["command"] = job["tasks"][0]["command"]
 
     save_history(record)
 
@@ -1570,13 +1893,27 @@ def submit_batch(
         if verbose:
             print()
             print(
-                job["command"],
-                end=(
-                    ""
-                    if job["command"].endswith("\n")
-                    else "\n"
-                ),
+                f"mode={job['mode']} | "
+                f"cpu_budget={NOTEBOOK_CPU_COUNT}"
             )
+
+            for task_index, task in enumerate(
+                job["tasks"],
+                start=1,
+            ):
+                print(
+                    f"task-{task_index} | "
+                    f"cpus={task['cpus']}"
+                )
+                print(
+                    task["command"],
+                    end=(
+                        ""
+                        if task["command"].endswith("\n")
+                        else "\n"
+                    ),
+                )
+
             print()
 
     print()

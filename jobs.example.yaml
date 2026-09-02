@@ -1,3 +1,10 @@
 jobs:
-- id: example_job
-  command: echo "Hello from Kaggle"
+- id: single_example
+  command: echo "Hello from Kaggle with 4 CPUs"
+
+- id: parallel_example
+  parallel:
+  - cpus: 2
+    command: echo "Parallel task 1 with 2 CPUs"
+  - cpus: 2
+    command: echo "Parallel task 2 with 2 CPUs"

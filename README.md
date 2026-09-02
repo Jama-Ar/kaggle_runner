@@ -69,14 +69,34 @@ Additional notebook cells may be added around them. Before submission, the runne
 
 ## Jobs
 
-Example:
+Each top-level job occupies one Kaggle worker and has a CPU budget of 4.
+
+A normal job needs no resource configuration. It receives all 4 CPUs:
 
 ```yaml
 jobs:
-  - id: example_job
+  - id: single_example
     command: |
-      echo "Hello from Kaggle"
+      python train.py
 ```
+
+A parallel job splits the same 4-CPU budget across two or more commands. The `cpus` values must sum to exactly 4:
+
+```yaml
+jobs:
+  - id: parallel_example
+    parallel:
+      - cpus: 2
+        command: |
+          python train.py --run first
+      - cpus: 2
+        command: |
+          python train.py --run second
+```
+
+Parallel commands are prepared first and released together. Each process tree is restricted to its assigned Linux CPU affinity, and common numerical-library thread limits are set to the same CPU count. Valid allocations include `2+2`, `1+3`, `1+1+2`, and `1+1+1+1`.
+
+The commands of a parallel job share the same project directory and Kaggle output directory, so commands should use distinct output paths or run names when necessary. Results are collected under the top-level job id.
 
 Submit all jobs:
 
