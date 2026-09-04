@@ -51,6 +51,21 @@ Each source snapshot contains a runner-owned `kaggle_runner_source.json` marker 
 
 The setup command runs inside `project.kaggle_workdir` before each job command. Setup uses fail-fast shell semantics, so any failing setup command aborts the notebook instead of being masked by a later successful command.
 
+### Git submodules
+
+`project.submodules` is optional. List the relative paths of Git submodules that must be included in the Kaggle source snapshot:
+
+```yaml
+project:
+  repo_path: ../your_project
+  remote: origin
+  branch: main
+  submodules:
+    - external_assets
+```
+
+The runner reads each submodule commit from the selected project commit, then archives that exact commit into the same relative directory in `source.zip`. A branch update in the submodule therefore cannot change a submitted source snapshot. Each configured submodule must be initialized locally; the runner will fetch the pinned commit if it is not already available.
+
 ## Templates
 
 Tracked generic templates:

@@ -2,6 +2,7 @@ project:
   repo_path: ../your_project
   remote: origin
   branch: main
+  submodules: []
   kaggle_workdir: /kaggle/temp/project
   setup_command: null
 kaggle:

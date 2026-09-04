@@ -26,12 +26,14 @@ ACTIVE_STATUSES = {
     "RUNNING",
     "QUEUED",
     "PENDING",
+     "CANCEL_REQUESTED",
 }
 
 FREE_STATUSES = {
     "COMPLETE",
     "ERROR",
     "CANCELLED",
+    "CANCEL_ACKNOWLEDGED",
 }
 
 
@@ -73,13 +75,58 @@ REPO_PATH = (ROOT / PROJECT_CONFIG["repo_path"]).resolve()
 REMOTE = PROJECT_CONFIG.get("remote", "origin")
 BRANCH = PROJECT_CONFIG["branch"]
 
+SUBMODULE_PATHS = PROJECT_CONFIG.get("submodules", [])
+
+if SUBMODULE_PATHS is None:
+    SUBMODULE_PATHS = []
+
+if not isinstance(SUBMODULE_PATHS, list):
+    raise ValueError(
+        "project.submodules must be a list or null."
+    )
+
+normalized_submodule_paths = []
+seen_submodule_paths = set()
+
+for index, submodule_path in enumerate(
+    SUBMODULE_PATHS,
+    start=1,
+):
+    if not isinstance(submodule_path, str):
+        raise ValueError(
+            f"project.submodules entry {index} must be a string."
+        )
+
+    normalized = submodule_path.replace("\\", "/").strip("/")
+    parts = normalized.split("/")
+
+    if (
+        not normalized
+        or submodule_path.startswith(("/", "\\"))
+        or any(part in {"", ".", ".."} for part in parts)
+        or ":" in parts[0]
+    ):
+        raise ValueError(
+            f"Invalid project submodule path: {submodule_path!r}"
+        )
+
+    if normalized in seen_submodule_paths:
+        raise ValueError(
+            f"Duplicate project submodule path: {normalized}"
+        )
+
+    seen_submodule_paths.add(normalized)
+    normalized_submodule_paths.append(normalized)
+
+SUBMODULE_PATHS = normalized_submodule_paths
+
 USERNAME = KAGGLE_CONFIG["username"]
 
 SOURCE_PATH = (ROOT / KAGGLE_CONFIG["source_dir"]).resolve()
 SOURCE_ZIP_PATH = SOURCE_PATH / "source.zip"
 SOURCE_MANIFEST_PATH = SOURCE_PATH / "source_manifest.json"
 
-SOURCE_FORMAT_VERSION = 2
+SOURCE_FORMAT_VERSION = 3
 SOURCE_MARKER_NAME = "kaggle_runner_source.json"
 
 DATASET = f"{USERNAME}/{KAGGLE_CONFIG['source_dataset']}"
@@ -371,6 +418,231 @@ def get_latest_project_commit():
 
 
 
+def resolve_submodule_commits(commit):
+    resolved = {}
+
+    for submodule_path in SUBMODULE_PATHS:
+        output = run(
+            [
+                "git",
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                commit,
+                "--",
+                submodule_path,
+            ],
+            cwd=REPO_PATH,
+        )
+
+        match = re.fullmatch(
+            r"160000 commit ([0-9a-fA-F]{40,64})\t([\s\S]+)",
+            output.rstrip("\0"),
+        )
+
+        if (
+            match is None
+            or match.group(2).replace("\\", "/")
+            != submodule_path
+        ):
+            raise RuntimeError(
+                f"Configured submodule '{submodule_path}' is not "
+                f"a Git submodule in project commit {commit}."
+            )
+
+        resolved[submodule_path] = match.group(1)
+
+    return resolved
+
+
+def get_initialized_submodule_repo(submodule_path):
+    repository = (REPO_PATH / submodule_path).resolve()
+
+    try:
+        repository.relative_to(REPO_PATH)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Configured submodule '{submodule_path}' is outside "
+            "the project repository."
+        ) from exc
+
+    if not repository.is_dir():
+        raise RuntimeError(
+            f"Configured submodule '{submodule_path}' is not "
+            "initialized locally. Run: "
+            f"git -C {REPO_PATH} submodule update --init -- "
+            f"{submodule_path}"
+        )
+
+    try:
+        repository_root = Path(
+            run(
+                [
+                    "git",
+                    "rev-parse",
+                    "--show-toplevel",
+                ],
+                cwd=repository,
+            )
+        ).resolve()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Configured submodule '{submodule_path}' is not "
+            "an initialized Git repository."
+        ) from exc
+
+    if repository_root != repository:
+        raise RuntimeError(
+            f"Configured submodule '{submodule_path}' is not "
+            "an initialized Git repository."
+        )
+
+    return repository
+
+
+def has_git_commit(repository, commit):
+    result = subprocess.run(
+        [
+            "git",
+            "cat-file",
+            "-e",
+            f"{commit}^{{commit}}",
+        ],
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    return result.returncode == 0
+
+
+def ensure_submodule_commit_available(submodule_path, commit):
+    repository = get_initialized_submodule_repo(submodule_path)
+
+    if has_git_commit(repository, commit):
+        return repository
+
+    remotes = [
+        remote.strip()
+        for remote in run(
+            ["git", "remote"],
+            cwd=repository,
+        ).splitlines()
+        if remote.strip()
+    ]
+
+    if not remotes:
+        raise RuntimeError(
+            f"Submodule '{submodule_path}' does not contain "
+            f"commit {commit} and has no Git remote."
+        )
+
+    remote = "origin" if "origin" in remotes else remotes[0]
+
+    try:
+        run(
+            [
+                "git",
+                "fetch",
+                remote,
+                commit,
+            ],
+            cwd=repository,
+        )
+    except RuntimeError:
+        run(
+            ["git", "fetch", remote],
+            cwd=repository,
+        )
+
+    if not has_git_commit(repository, commit):
+        raise RuntimeError(
+            f"Could not resolve pinned commit {commit} for "
+            f"submodule '{submodule_path}'."
+        )
+
+    return repository
+
+
+def append_submodule_to_source_archive(submodule_path, commit):
+    repository = ensure_submodule_commit_available(
+        submodule_path,
+        commit,
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="kaggle_submodule_archive_"
+    ) as temp_name:
+        submodule_zip = Path(temp_name) / "submodule.zip"
+
+        run(
+            [
+                "git",
+                "archive",
+                "--format=zip",
+                f"--prefix={submodule_path}/",
+                f"--output={submodule_zip}",
+                commit,
+            ],
+            cwd=repository,
+        )
+
+        with zipfile.ZipFile(
+            SOURCE_ZIP_PATH,
+            mode="a",
+        ) as destination, zipfile.ZipFile(
+            submodule_zip,
+            mode="r",
+        ) as source:
+            existing_names = set(destination.namelist())
+
+            for info in source.infolist():
+                if info.filename in existing_names:
+                    continue
+
+                if info.is_dir():
+                    destination.writestr(info, b"")
+                else:
+                    with source.open(
+                        info,
+                        mode="r",
+                    ) as source_file, destination.open(
+                        info,
+                        mode="w",
+                        force_zip64=True,
+                    ) as destination_file:
+                        shutil.copyfileobj(
+                            source_file,
+                            destination_file,
+                            length=1024 * 1024,
+                        )
+
+                existing_names.add(info.filename)
+
+
+def build_source_archive(commit, submodule_commits):
+    if SOURCE_ZIP_PATH.exists():
+        SOURCE_ZIP_PATH.unlink()
+
+    run(
+        [
+            "git",
+            "archive",
+            "--format=zip",
+            f"--output={SOURCE_ZIP_PATH}",
+            commit,
+        ],
+        cwd=REPO_PATH,
+    )
+
+    for submodule_path, submodule_commit in submodule_commits.items():
+        append_submodule_to_source_archive(
+            submodule_path,
+            submodule_commit,
+        )
+
+
 def get_remote_source_manifest():
     with tempfile.TemporaryDirectory(
         prefix="kaggle_source_manifest_"
@@ -441,12 +713,13 @@ def write_dataset_metadata():
         encoding="utf-8",
     )
 
-def add_source_marker_to_archive(commit):
+def add_source_marker_to_archive(commit, submodule_commits):
     marker = {
         "format_version": SOURCE_FORMAT_VERSION,
         "commit": commit,
         "remote": REMOTE,
         "branch": BRANCH,
+        "submodules": submodule_commits,
     }
 
     with zipfile.ZipFile(
@@ -492,8 +765,32 @@ def add_source_marker_to_archive(commit):
             "Source marker commit does not match archive commit."
         )
 
+    if stored_marker.get("submodules", {}) != submodule_commits:
+        raise RuntimeError(
+            "Source marker submodules do not match source archive."
+        )
+
+
+def write_source_manifest(commit, submodule_commits):
+    SOURCE_MANIFEST_PATH.write_text(
+        json.dumps(
+            {
+                "format_version": SOURCE_FORMAT_VERSION,
+                "commit": commit,
+                "remote": REMOTE,
+                "branch": BRANCH,
+                "marker": SOURCE_MARKER_NAME,
+                "submodules": submodule_commits,
+                "created_at": utc_now(),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
 def update_source_if_needed(commit, worker_states):
     remote_manifest = get_remote_source_manifest()
+    submodule_commits = resolve_submodule_commits(commit)
 
     remote_commit = (
         remote_manifest.get("commit")
@@ -507,9 +804,16 @@ def update_source_if_needed(commit, worker_states):
         else None
     )
 
+    remote_submodules = (
+        remote_manifest.get("submodules", {})
+        if isinstance(remote_manifest, dict)
+        else {}
+    )
+
     if (
         remote_commit == commit
         and remote_format_version == SOURCE_FORMAT_VERSION
+        and remote_submodules == submodule_commits
     ):
         print("Kaggle source is already up to date.")
         return
@@ -539,42 +843,20 @@ def update_source_if_needed(commit, worker_states):
 
     write_dataset_metadata()
 
-    if SOURCE_ZIP_PATH.exists():
-        SOURCE_ZIP_PATH.unlink()
-
-    run(
-        [
-            "git",
-            "archive",
-            "--format=zip",
-            f"--output={SOURCE_ZIP_PATH}",
-            f"{REMOTE}/{BRANCH}",
-        ],
-        cwd=REPO_PATH,
-    )
-
-    add_source_marker_to_archive(commit)
-
-    SOURCE_MANIFEST_PATH.write_text(
-        json.dumps(
-            {
-                "format_version": SOURCE_FORMAT_VERSION,
-                "commit": commit,
-                "remote": REMOTE,
-                "branch": BRANCH,
-                "marker": SOURCE_MARKER_NAME,
-                "created_at": utc_now(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    build_source_archive(commit, submodule_commits)
+    add_source_marker_to_archive(commit, submodule_commits)
+    write_source_manifest(commit, submodule_commits)
 
     print(f"Source commit: {commit}")
     print(
         f"Source format: v{SOURCE_FORMAT_VERSION} "
         f"({SOURCE_MARKER_NAME})"
     )
+    for submodule_path, submodule_commit in submodule_commits.items():
+        print(
+            f"Source submodule: {submodule_path} @ "
+            f"{submodule_commit}"
+        )
     print("Uploading source to Kaggle...")
 
     run(
@@ -1686,6 +1968,8 @@ def display_status(verbose=False):
             "COMPLETE": "Completed",
             "ERROR": "Error",
             "CANCELLED": "Cancelled",
+            "CANCEL_REQUESTED": "Cancel Requested",
+            "CANCEL_ACKNOWLEDGED": "Cancelled",
         }.get(
             status,
             status.title(),
@@ -2003,32 +2287,10 @@ def write_initial_source_snapshot(commit):
     SOURCE_PATH.mkdir(parents=True, exist_ok=True)
     write_dataset_metadata()
 
-    if SOURCE_ZIP_PATH.exists():
-        SOURCE_ZIP_PATH.unlink()
-
-    run(
-        [
-            "git",
-            "archive",
-            "--format=zip",
-            f"--output={SOURCE_ZIP_PATH}",
-            f"{REMOTE}/{BRANCH}",
-        ],
-        cwd=REPO_PATH,
-    )
-
-    SOURCE_MANIFEST_PATH.write_text(
-        json.dumps(
-            {
-                "commit": commit,
-                "remote": REMOTE,
-                "branch": BRANCH,
-                "created_at": utc_now(),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    submodule_commits = resolve_submodule_commits(commit)
+    build_source_archive(commit, submodule_commits)
+    add_source_marker_to_archive(commit, submodule_commits)
+    write_source_manifest(commit, submodule_commits)
 
 
 def wait_for_source_dataset(timeout=300):
