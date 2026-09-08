@@ -788,7 +788,7 @@ def write_source_manifest(commit, submodule_commits):
         encoding="utf-8",
     )
 
-def update_source_if_needed(commit, worker_states):
+def update_source_if_needed(commit):
     remote_manifest = get_remote_source_manifest()
     submodule_commits = resolve_submodule_commits(commit)
 
@@ -817,24 +817,6 @@ def update_source_if_needed(commit, worker_states):
     ):
         print("Kaggle source is already up to date.")
         return
-
-    active_workers = [
-        state
-        for state in worker_states
-        if state["status"] in ACTIVE_STATUSES
-    ]
-
-    if active_workers:
-        active_text = ", ".join(
-            f"worker-{state['worker']['number']}"
-            for state in active_workers
-        )
-
-        raise RuntimeError(
-            "The Kaggle source version must change, but jobs are still "
-            f"active on {active_text}. Wait for them to finish before "
-            "switching the shared source version."
-        )
 
     SOURCE_PATH.mkdir(
         parents=True,
@@ -2140,13 +2122,10 @@ def submit_batch(
     for job in jobs:
         print(f"  - {job['id']}")
 
-    worker_states = get_worker_states()
-
     commit = get_latest_project_commit()
 
     update_source_if_needed(
-        commit,
-        worker_states,
+        commit
     )
 
     prepared_workers = prepare_workers(
