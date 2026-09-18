@@ -1097,6 +1097,9 @@ try:
     for task in resolved_tasks:
         env = os.environ.copy()
 
+        # The Kaggle project tree is a git-archive snapshot, not a checkout.
+        env["KAGGLE_RUNNER_SOURCE_COMMIT"] = SOURCE_COMMIT
+
         for variable in THREAD_LIMIT_VARIABLES:
             env[variable] = str(task["cpus"])
 
