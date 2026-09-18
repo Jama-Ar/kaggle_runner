@@ -2031,6 +2031,46 @@ def find_local_archives(job_id):
     return sorted(matches)
 
 
+def resolve_result_job_id(selector):
+    if re.fullmatch(r"worker-[0-9]+", selector) is None:
+        return selector
+
+    worker = next(
+        (
+            worker
+            for worker in WORKERS
+            if f"worker-{worker['number']}" == selector
+        ),
+        None,
+    )
+
+    if worker is None:
+        available = ", ".join(
+            f"worker-{worker['number']}"
+            for worker in WORKERS
+        )
+        raise ValueError(
+            f"Unknown worker '{selector}'. Available workers: {available}"
+        )
+
+    metadata = None
+
+    if get_worker_status(worker) not in ACTIVE_STATUSES:
+        metadata = get_current_job_metadata(worker)
+
+    if metadata is None:
+        metadata = load_latest_history_by_worker().get(worker["number"])
+
+    job_id = metadata.get("job_id") if metadata is not None else None
+
+    if not isinstance(job_id, str) or not job_id:
+        raise RuntimeError(
+            f"No job id is available for {selector}."
+        )
+
+    return job_id
+
+
 def collect_results(job_id, verbose=False):
     existing = find_local_archives(job_id)
 
@@ -2619,10 +2659,12 @@ def main():
 
     parser.add_argument(
         "--results",
-        metavar="JOB_ID",
+        nargs="+",
+        metavar="JOB_ID_OR_WORKER",
         help=(
             "Download and archive the current Kaggle output "
-            "for the specified job id."
+            "for one or more job ids or worker names (e.g. worker-1). "
+            "Job ids and worker names can be mixed."
         ),
     )
 
@@ -2688,10 +2730,19 @@ def main():
                 "--id cannot be combined with --results."
             )
 
-        collect_results(
-            args.results,
-            verbose=args.verbose,
-        )
+        collected_job_ids = set()
+
+        for selector in dict.fromkeys(args.results):
+            job_id = resolve_result_job_id(selector)
+
+            if job_id in collected_job_ids:
+                continue
+
+            collect_results(
+                job_id,
+                verbose=args.verbose,
+            )
+            collected_job_ids.add(job_id)
 
         return
 
