@@ -66,6 +66,51 @@ def load_runner_config():
     return config
 
 
+def validate_submodule_paths(paths):
+    if paths is None:
+        paths = []
+
+    if not isinstance(paths, list):
+        raise ValueError(
+            "project.submodules must be a list or null."
+        )
+
+    normalized_submodule_paths = []
+    seen_submodule_paths = set()
+
+    for index, submodule_path in enumerate(
+        paths,
+        start=1,
+    ):
+        if not isinstance(submodule_path, str):
+            raise ValueError(
+                f"project.submodules entry {index} must be a string."
+            )
+
+        normalized = submodule_path.replace("\\", "/").strip("/")
+        parts = normalized.split("/")
+
+        if (
+            not normalized.strip()
+            or submodule_path.startswith(("/", "\\"))
+            or any(part in {"", ".", ".."} for part in parts)
+            or ":" in parts[0]
+        ):
+            raise ValueError(
+                f"Invalid project submodule path: {submodule_path!r}"
+            )
+
+        if normalized in seen_submodule_paths:
+            raise ValueError(
+                f"Duplicate project submodule path: {normalized}"
+            )
+
+        seen_submodule_paths.add(normalized)
+        normalized_submodule_paths.append(normalized)
+
+    return normalized_submodule_paths
+
+
 CONFIG = load_runner_config()
 
 PROJECT_CONFIG = CONFIG["project"]
@@ -75,50 +120,9 @@ REPO_PATH = (ROOT / PROJECT_CONFIG["repo_path"]).resolve()
 REMOTE = PROJECT_CONFIG.get("remote", "origin")
 BRANCH = PROJECT_CONFIG["branch"]
 
-SUBMODULE_PATHS = PROJECT_CONFIG.get("submodules", [])
-
-if SUBMODULE_PATHS is None:
-    SUBMODULE_PATHS = []
-
-if not isinstance(SUBMODULE_PATHS, list):
-    raise ValueError(
-        "project.submodules must be a list or null."
-    )
-
-normalized_submodule_paths = []
-seen_submodule_paths = set()
-
-for index, submodule_path in enumerate(
-    SUBMODULE_PATHS,
-    start=1,
-):
-    if not isinstance(submodule_path, str):
-        raise ValueError(
-            f"project.submodules entry {index} must be a string."
-        )
-
-    normalized = submodule_path.replace("\\", "/").strip("/")
-    parts = normalized.split("/")
-
-    if (
-        not normalized
-        or submodule_path.startswith(("/", "\\"))
-        or any(part in {"", ".", ".."} for part in parts)
-        or ":" in parts[0]
-    ):
-        raise ValueError(
-            f"Invalid project submodule path: {submodule_path!r}"
-        )
-
-    if normalized in seen_submodule_paths:
-        raise ValueError(
-            f"Duplicate project submodule path: {normalized}"
-        )
-
-    seen_submodule_paths.add(normalized)
-    normalized_submodule_paths.append(normalized)
-
-SUBMODULE_PATHS = normalized_submodule_paths
+SUBMODULE_PATHS = validate_submodule_paths(
+    PROJECT_CONFIG.get("submodules", [])
+)
 
 USERNAME = KAGGLE_CONFIG["username"]
 
@@ -466,12 +470,18 @@ def get_initialized_submodule_repo(submodule_path):
             "the project repository."
         ) from exc
 
-    if not repository.is_dir():
-        raise RuntimeError(
-            f"Configured submodule '{submodule_path}' is not "
-            "initialized locally. Run: "
-            f"git -C {REPO_PATH} submodule update --init -- "
-            f"{submodule_path}"
+    if not (repository / ".git").exists():
+        run(
+            [
+                "git",
+                "--literal-pathspecs",
+                "submodule",
+                "update",
+                "--init",
+                "--",
+                submodule_path,
+            ],
+            cwd=REPO_PATH,
         )
 
     try:
@@ -581,7 +591,6 @@ def append_submodule_to_source_archive(submodule_path, commit):
                 "git",
                 "archive",
                 "--format=zip",
-                f"--prefix={submodule_path}/",
                 f"--output={submodule_zip}",
                 commit,
             ],
@@ -598,8 +607,13 @@ def append_submodule_to_source_archive(submodule_path, commit):
             existing_names = set(destination.namelist())
 
             for info in source.infolist():
+                # Prefix entries here: git archive --prefix also emits a root
+                # directory entry that duplicates the parent's Gitlink directory.
+                info.filename = f"{submodule_path}/{info.filename}"
                 if info.filename in existing_names:
-                    continue
+                    raise RuntimeError(
+                        f"Source ZIP collision: {info.filename}"
+                    )
 
                 if info.is_dir():
                     destination.writestr(info, b"")
@@ -727,6 +741,13 @@ def add_source_marker_to_archive(commit, submodule_commits):
         mode="a",
         compression=zipfile.ZIP_DEFLATED,
     ) as archive:
+        if (
+            SOURCE_MARKER_NAME in archive.namelist()
+            or f"{SOURCE_MARKER_NAME}/" in archive.namelist()
+        ):
+            raise RuntimeError(
+                f"Source ZIP collision: {SOURCE_MARKER_NAME}"
+            )
         archive.writestr(
             SOURCE_MARKER_NAME,
             json.dumps(
